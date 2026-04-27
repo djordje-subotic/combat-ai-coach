@@ -1,5 +1,8 @@
 import Anthropic from "@anthropic-ai/sdk";
 import type { Lang } from "./i18n";
+import type { BiomechanicalReport } from "./biomechanics";
+import type { SelectedFrame } from "./frame-selector";
+import { getSportRulesPrompt, SPORT_RULES } from "./sport-rules";
 
 const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY!,
@@ -15,6 +18,11 @@ export interface AnalysisMoment {
   severity: "info" | "warning" | "critical";
   observation: string;
   recommendation: string;
+  telemetry?: {
+    guardHeight?: { left: number; right: number };
+    stanceWidth?: number;
+    strikeVelocity?: number;
+  };
 }
 
 export interface AnalysisResult {
@@ -26,217 +34,138 @@ export interface AnalysisResult {
   weaknesses: string[];
 }
 
-// ── Language instructions ─────────────────────────────
+// ── Language ──────────────────────────────────────────
 
 const LANG_INSTRUCTION: Record<Lang, string> = {
-  sr: `\n\nVAŽNO: Piši SVE na srpskom jeziku (latinica). Observation, recommendation, summary, strengths, weaknesses — sve na srpskom. Budi konkretan i koristi sportsku terminologiju.`,
-  en: `\n\nIMPORTANT: Write ALL output in English.`,
+  sr: `\nOBVEZNO piši SVE na srpskom jeziku (latinica). Observation, recommendation, summary, strengths, weaknesses — SVE na srpskom. Budi konkretan, koristi sportsku terminologiju.`,
+  en: `\nWrite ALL output in English.`,
 };
 
-// ── Prompts ───────────────────────────────────────────
+// ── Single-Pass Analysis ─────────────────────────────
 
-const SCAN_SYSTEM = `You are an expert combat sports coach. You will see a sequence of frames from a sparring session, each taken 1 second apart.
+function buildSystemPrompt(sport: string, lang: Lang, negatives: string[]): string {
+  const sportName = SPORT_RULES[sport]?.name ?? "MMA";
+  const sportRules = getSportRulesPrompt(sport);
 
-YOUR TASK: Identify which timestamps contain technically interesting moments worth analyzing in detail.
+  const negativesBlock = negatives.length > 0
+    ? `\nTHINGS THE TELEMETRY DID NOT DETECT — DO NOT MENTION THESE:\n${negatives.map((n) => `- ${n}`).join("\n")}\n`
+    : "";
 
-A "technically interesting moment" is:
-- A punch/kick being thrown or landing
-- Guard visibly dropping or being held incorrectly
-- A clear defensive movement (slip, roll, block, parry)
-- A takedown, sweep, or submission attempt
-- A scramble or transition
-- Significant footwork — cutting angles, pivoting, retreating flat-footed
-- A clean opening that was exploited or missed
+  return `You are an elite ${sportName} coach reviewing sparring footage through biomechanical telemetry.
 
-DO NOT flag:
-- Normal stance with nothing happening
-- Walking/circling with no engagement
-- Moments where you can't clearly see what's happening (blurry, obstructed)
+== YOUR DATA SOURCES ==
 
-CRITICAL RULES:
-- Only flag what you can CLEARLY SEE in the frame. Never guess or infer.
-- If a frame is blurry or obstructed, skip it.
-- Better to flag fewer high-confidence moments than many uncertain ones.
-- Use the EXACT timestamp labels shown on each frame.`;
+1. BIOMECHANICAL TELEMETRY — pose tracking computed joint angles, guard heights, wrist velocities, and stance measurements at every frame. These numbers are FACTS.
+2. KEY FRAMES — a few still images from moments where telemetry flagged an event. Use these ONLY to add visual context (which fighter, what gear, ring position). Do NOT try to analyze technique from images — the telemetry is far more precise.
 
-function getDetailSystem(lang: Lang) {
-  return `You are an expert combat sports coach doing a detailed breakdown of a specific moment in sparring.
+== ABSOLUTE RULES (VIOLATION = FAILURE) ==
 
-You will see 3 consecutive frames (1 second apart) showing a specific moment. Compare the frames to understand the MOTION — what changed between frame 1, 2, and 3.
+1. You may ONLY discuss events that appear in the DETECTED EVENTS list. If an event is not listed, it DID NOT HAPPEN. Do not invent events.
+2. Every observation you make MUST cite a specific telemetry number. Not "guard was low" but "guard at 28% for 2.1s starting at 0:04".
+3. NEVER claim a specific technique (jab, cross, hook, kick, takedown, etc.) unless the telemetry explicitly lists it as a detected event. If the telemetry says "punch" you may say punch. If it doesn't say "kick" you MUST NOT say kick.
+4. Do NOT describe what you "see" in frames. The frames are low-resolution still images — you cannot reliably identify techniques from them. Trust the numbers only.
+5. If the telemetry detected few or no events, that is fine. Say the session was clean. Do NOT fill the analysis with imagined problems.
+6. Each recommendation must be a specific, drillable exercise. Not "improve your guard" but "Practice 3-minute shadow boxing rounds where you touch your chin with your glove after every punch to build the habit of hand return."
+${negativesBlock}
+== ${sportName.toUpperCase()} TECHNIQUE STANDARDS ==
+${sportRules}
 
-ANALYSIS RULES:
-1. ONLY describe what you can clearly see. If you're not sure, say so or skip it.
-2. Compare frames to detect motion: describe what CHANGED between frame 1→2→3.
-3. Be specific about WHICH fighter you mean. Use their position ("the fighter on the left") or appearance ("the fighter in the dark shorts").
-4. Don't invent techniques you can't see. If someone's hand is low, don't assume they just threw a punch — they might just have bad guard habits.
-5. Give concrete, actionable advice. Not "keep your hands up" but "after throwing the jab, immediately return the hand to guard position — your left hand stayed extended for ~1 second, giving your opponent a free line to your chin."
-6. The "observation" should describe what is happening and what's wrong or right.
-7. The "recommendation" should be specific coaching instruction — what to practice, what to change.${LANG_INSTRUCTION[lang]}`;
+== OUTPUT CONSTRAINTS ==
+- Moments array must correspond 1:1 to detected events. One moment per event, no extras.
+- If there are 0 events, return an empty moments array and focus summary on overall metrics (average guard, stance, lean).
+- severity must match: guard_drop > 3s = critical, > 1.5s = warning, else info. punch = info.
+- overallScore: 8-10 = very few issues, 5-7 = some guard/stance problems, 1-4 = persistent critical issues.
+${LANG_INSTRUCTION[lang]}`;
 }
 
-// ── Pass 1: Scan ──────────────────────────────────────
+function buildTelemetrySummary(report: BiomechanicalReport): string {
+  const ts = report.timeSeries;
+  const events = report.events;
 
-interface ScanMoment {
-  seconds: number;
-  reason: string;
+  let summary = `=== BIOMECHANICAL TELEMETRY (${report.fps}fps, ${report.personCount} person(s) tracked) ===\n\n`;
+
+  summary += `SESSION AVERAGES:\n`;
+  summary += `- Guard height: Left=${(ts.guardHeightAvg.left * 100).toFixed(0)}%, Right=${(ts.guardHeightAvg.right * 100).toFixed(0)}% (100%=above nose, 0%=at waist)\n`;
+  summary += `- Stance width: ${ts.avgStanceWidth.toFixed(2)}x shoulder width\n`;
+  summary += `- Torso lean: ${ts.avgTorsoLean.toFixed(1)}° from vertical\n`;
+  summary += `- Total guard drops detected: ${ts.guardDropCount} (total duration: ${ts.guardDropTotalDuration.toFixed(1)}s)\n`;
+  summary += `- Total punches detected: ${ts.punchCount}\n\n`;
+
+  summary += `DETECTED EVENTS (${events.length} total):\n`;
+  if (events.length > 0) {
+    for (const e of events) {
+      const mins = Math.floor(e.timestampSeconds / 60);
+      const secs = Math.floor(e.timestampSeconds % 60);
+      summary += `  [${mins}:${String(secs).padStart(2, "0")}] ${e.type.toUpperCase()} (${e.severity}): ${e.details} [confidence: ${(e.confidence * 100).toFixed(0)}%]\n`;
+    }
+  } else {
+    summary += `  (none — session was clean or telemetry had insufficient data)\n`;
+  }
+
+  return summary;
 }
 
-async function scanForMoments(
-  frames: { base64: string; timestampSeconds: number }[]
-): Promise<ScanMoment[]> {
+export type ProgressCallback = (step: string, detail: string) => void;
+
+export async function analyzeWithTelemetry(
+  report: BiomechanicalReport,
+  keyFrames: SelectedFrame[],
+  lang: Lang,
+  onProgress?: ProgressCallback
+): Promise<AnalysisResult> {
+  const sport = report.detectedSport.sport;
+  onProgress?.("analysis", `AI coach analyzing (${sport}, ${keyFrames.length} key frames, ${report.events.length} events)...`);
+
+  const telemetrySummary = buildTelemetrySummary(report);
+
   const content: Anthropic.Messages.ContentBlockParam[] = [
     {
       type: "text",
-      text: `Review these ${frames.length} frames (1 second apart) and identify timestamps with technically interesting moments.
+      text: `${telemetrySummary}
 
-Return JSON array:
-[{"seconds": <number>, "reason": "brief reason"}]
+=== KEY FRAMES (${keyFrames.length}) — for visual context only ===
 
-Return ONLY the JSON array, no markdown fences. If nothing interesting is happening, return an empty array [].`,
+Analyze this sparring session based on the telemetry above.
+
+Return JSON:
+{
+  "summary": "2-3 sentences. Reference specific telemetry numbers and timestamps. If few events: focus on overall averages.",
+  "sport": "${sport}",
+  "moments": [
+    {
+      "timestamp": "M:SS",
+      "seconds": <must match a DETECTED EVENT timestamp>,
+      "duration": 3,
+      "category": "defense|offense|positioning|movement|critical",
+      "severity": "info|warning|critical",
+      "observation": "Describe the event using EXACT telemetry numbers. What happened biomechanically.",
+      "recommendation": "A specific drill or correction. Must be actionable and practicable."
+    }
+  ],
+  "overallScore": <1-10>,
+  "strengths": ["cite specific metrics that were good"],
+  "weaknesses": ["cite specific metrics that need work"]
+}
+
+REMEMBER: Only create moments for events in the DETECTED EVENTS list. No extras. No guessing.
+Return ONLY valid JSON, no markdown fences.`,
     },
   ];
 
-  for (const frame of frames) {
+  for (const frame of keyFrames) {
     const mins = Math.floor(frame.timestampSeconds / 60);
     const secs = String(Math.floor(frame.timestampSeconds % 60)).padStart(2, "0");
     content.push(
-      { type: "text", text: `[${mins}:${secs} — second ${frame.timestampSeconds}]` },
-      {
-        type: "image",
-        source: { type: "base64", media_type: "image/jpeg", data: frame.base64 },
-      }
+      { type: "text", text: `--- Visual context: ${mins}:${secs} ---\n${frame.telemetryContext}` },
+      { type: "image", source: { type: "base64", media_type: "image/jpeg", data: frame.base64 } }
     );
   }
 
   const response = await anthropic.messages.create({
     model: "claude-sonnet-4-5-20250929",
-    max_tokens: 2048,
-    system: SCAN_SYSTEM,
+    max_tokens: 8192,
+    system: buildSystemPrompt(sport, lang, report.negatives),
     messages: [{ role: "user", content }],
-  });
-
-  const text = response.content[0].type === "text" ? response.content[0].text : "[]";
-  let cleaned = text.trim();
-  if (cleaned.startsWith("```")) {
-    cleaned = cleaned.replace(/^```(?:json)?\n?/, "").replace(/\n?```$/, "");
-  }
-
-  try {
-    return JSON.parse(cleaned) as ScanMoment[];
-  } catch {
-    console.error("Scan parse error, raw:", text);
-    return [];
-  }
-}
-
-// ── Pass 2: Detail ────────────────────────────────────
-
-async function analyzeDetailMoment(
-  triplet: { base64: string; timestampSeconds: number }[],
-  scanReason: string,
-  lang: Lang
-): Promise<AnalysisMoment | null> {
-  const centerTime = triplet[1]?.timestampSeconds ?? triplet[0].timestampSeconds;
-  const mins = Math.floor(centerTime / 60);
-  const secs = String(Math.floor(centerTime % 60)).padStart(2, "0");
-
-  const content: Anthropic.Messages.ContentBlockParam[] = [
-    {
-      type: "text",
-      text: `These 3 consecutive frames (1 sec apart) show a moment flagged as: "${scanReason}"
-
-Analyze the motion across these frames. What technique is being used? What errors or good technique do you see?
-
-Return JSON:
-{
-  "timestamp": "${mins}:${secs}",
-  "seconds": ${centerTime},
-  "duration": 3,
-  "category": "defense|offense|positioning|movement|critical",
-  "severity": "info|warning|critical",
-  "observation": "Detailed description comparing what you see across the 3 frames.",
-  "recommendation": "Specific, actionable coaching advice. What exactly should the fighter practice or change."
-}
-
-RULES:
-- Compare frame 1→2→3 to understand motion. Describe what CHANGED.
-- Only report what you can clearly see. If uncertain, set severity to "info".
-- Return ONLY JSON, no markdown fences.`,
-    },
-  ];
-
-  triplet.forEach((frame, i) => {
-    const fmins = Math.floor(frame.timestampSeconds / 60);
-    const fsecs = String(Math.floor(frame.timestampSeconds % 60)).padStart(2, "0");
-    content.push(
-      { type: "text", text: `Frame ${i + 1} of 3 [${fmins}:${fsecs}]` },
-      {
-        type: "image",
-        source: { type: "base64", media_type: "image/jpeg", data: frame.base64 },
-      }
-    );
-  });
-
-  const response = await anthropic.messages.create({
-    model: "claude-sonnet-4-5-20250929",
-    max_tokens: 1024,
-    system: getDetailSystem(lang),
-    messages: [{ role: "user", content }],
-  });
-
-  const text = response.content[0].type === "text" ? response.content[0].text : "";
-  let cleaned = text.trim();
-  if (cleaned.startsWith("```")) {
-    cleaned = cleaned.replace(/^```(?:json)?\n?/, "").replace(/\n?```$/, "");
-  }
-
-  try {
-    return JSON.parse(cleaned) as AnalysisMoment;
-  } catch {
-    console.error("Detail parse error, raw:", text);
-    return null;
-  }
-}
-
-// ── Synthesize final summary ──────────────────────────
-
-async function synthesizeSummary(
-  moments: AnalysisMoment[],
-  lang: Lang
-): Promise<{
-  summary: string;
-  sport: string;
-  overallScore: number;
-  strengths: string[];
-  weaknesses: string[];
-}> {
-  const momentDescriptions = moments
-    .map((m) => `[${m.timestamp}] ${m.category}/${m.severity}: ${m.observation}`)
-    .join("\n");
-
-  const response = await anthropic.messages.create({
-    model: "claude-sonnet-4-5-20250929",
-    max_tokens: 1024,
-    system: `You are an expert combat sports coach summarizing a sparring analysis.${LANG_INSTRUCTION[lang]}`,
-    messages: [
-      {
-        role: "user",
-        content: `Based on these moment-by-moment observations from a sparring session, provide an overall assessment.
-
-${momentDescriptions}
-
-Return JSON:
-{
-  "summary": "2-3 sentence overall assessment. Be specific — reference actual moments.",
-  "sport": "boxing|mma|kickboxing|bjj",
-  "overallScore": <1-10>,
-  "strengths": ["strength1", "strength2", "strength3"],
-  "weaknesses": ["weakness1", "weakness2", "weakness3"]
-}
-
-Return ONLY JSON, no markdown fences.`,
-      },
-    ],
   });
 
   const text = response.content[0].type === "text" ? response.content[0].text : "{}";
@@ -244,119 +173,29 @@ Return ONLY JSON, no markdown fences.`,
   if (cleaned.startsWith("```")) {
     cleaned = cleaned.replace(/^```(?:json)?\n?/, "").replace(/\n?```$/, "");
   }
-  return JSON.parse(cleaned);
-}
 
-// ── Main pipeline ─────────────────────────────────────
+  const result = JSON.parse(cleaned) as AnalysisResult;
 
-export type ProgressCallback = (step: string, detail: string) => void;
-
-export async function analyzeSparring(
-  frames: { base64: string; timestampSeconds: number }[],
-  lang: Lang,
-  onProgress?: ProgressCallback
-): Promise<AnalysisResult> {
-  onProgress?.("scan", `Scanning ${frames.length} frames for key moments...`);
-
-  const SCAN_BATCH = 20;
-  const scanBatches: { base64: string; timestampSeconds: number }[][] = [];
-  for (let i = 0; i < frames.length; i += SCAN_BATCH) {
-    scanBatches.push(frames.slice(i, i + SCAN_BATCH));
-  }
-
-  const allScanMoments: ScanMoment[] = [];
-  for (const batch of scanBatches) {
-    const results = await scanForMoments(batch);
-    allScanMoments.push(...results);
-  }
-
-  // Deduplicate within 2 seconds
-  const dedupedMoments: ScanMoment[] = [];
-  const sorted = allScanMoments.sort((a, b) => a.seconds - b.seconds);
-  for (const m of sorted) {
-    const last = dedupedMoments[dedupedMoments.length - 1];
-    if (!last || m.seconds - last.seconds > 2) {
-      dedupedMoments.push(m);
-    }
-  }
-
-  onProgress?.(
-    "scan",
-    `Found ${dedupedMoments.length} interesting moments. Analyzing in detail...`
-  );
-
-  if (dedupedMoments.length === 0) {
-    const noMoments: Record<Lang, string> = {
-      sr: "Nisu detektovani jasni tehnički momenti. Moguće da je kvalitet videa nizak, ugao kamere nije idealan, ili je sparing vrlo čist.",
-      en: "No clearly interesting technical moments were detected. This could mean the video quality is too low, the camera angle isn't ideal, or the sparring is very clean.",
-    };
-    return {
-      summary: noMoments[lang],
-      sport: "mma",
-      moments: [],
-      overallScore: 5,
-      strengths: [],
-      weaknesses: [],
-    };
-  }
-
-  onProgress?.(
-    "detail",
-    `Analyzing ${dedupedMoments.length} moments in detail (3 frames each)...`
-  );
-
-  // Frame lookup
-  const frameBySecond = new Map<number, { base64: string; timestampSeconds: number }>();
-  for (const f of frames) {
-    frameBySecond.set(Math.round(f.timestampSeconds), f);
-  }
-
-  function getClosestFrame(targetSec: number) {
-    const exact = frameBySecond.get(Math.round(targetSec));
-    if (exact) return exact;
-    let closest = frames[0];
-    let minDist = Infinity;
-    for (const f of frames) {
-      const dist = Math.abs(f.timestampSeconds - targetSec);
-      if (dist < minDist) {
-        minDist = dist;
-        closest = f;
-      }
-    }
-    return closest;
-  }
-
-  const CONCURRENCY = 3;
-  const detailResults: (AnalysisMoment | null)[] = [];
-
-  for (let i = 0; i < dedupedMoments.length; i += CONCURRENCY) {
-    const chunk = dedupedMoments.slice(i, i + CONCURRENCY);
-    const promises = chunk.map((m) => {
-      const triplet = [
-        getClosestFrame(m.seconds - 1),
-        getClosestFrame(m.seconds),
-        getClosestFrame(m.seconds + 1),
-      ];
-      return analyzeDetailMoment(triplet, m.reason, lang);
-    });
-
-    const results = await Promise.all(promises);
-    detailResults.push(...results);
-
-    onProgress?.(
-      "detail",
-      `Analyzed ${Math.min(i + CONCURRENCY, dedupedMoments.length)}/${dedupedMoments.length} moments...`
+  // POST-PROCESSING: Filter out any moments that don't correspond to a real event
+  result.moments = result.moments.filter((moment) => {
+    const matchingEvent = report.events.find(
+      (e) => Math.abs(e.timestampSeconds - moment.seconds) <= 2
     );
+    return matchingEvent !== undefined;
+  });
+
+  // Enrich with telemetry data
+  for (const moment of result.moments) {
+    const metrics = report.frameMetrics.find(
+      (m) => Math.abs(m.timestampSeconds - moment.seconds) < 1.5
+    );
+    if (metrics) {
+      moment.telemetry = {
+        guardHeight: metrics.guardHeight.left >= 0 ? metrics.guardHeight : undefined,
+        stanceWidth: metrics.stanceWidth >= 0 ? metrics.stanceWidth : undefined,
+      };
+    }
   }
 
-  const validMoments = detailResults.filter((m): m is AnalysisMoment => m !== null);
-  validMoments.sort((a, b) => a.seconds - b.seconds);
-
-  onProgress?.("summary", "Generating overall assessment...");
-  const summary = await synthesizeSummary(validMoments, lang);
-
-  return {
-    ...summary,
-    moments: validMoments,
-  };
+  return result;
 }
